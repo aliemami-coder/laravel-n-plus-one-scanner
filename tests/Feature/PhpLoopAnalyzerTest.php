@@ -124,4 +124,90 @@ class PhpLoopAnalyzerTest extends TestCase
         $this->assertCount(1, $issues);
         $this->assertStringContainsString('->posts()->count()', $issues[0]->message);
     }
+
+    public function test_resets_eager_loads_on_reassignment_and_transfers_across_query_and_aliases(): void
+    {
+        $code = <<<'PHP'
+        <?php
+        namespace App\Http\Controllers;
+
+        use App\Models\User;
+
+        class UserController
+        {
+            public function reassigned()
+            {
+                $users = User::with('posts')->get();
+                $users = User::all();
+
+                foreach ($users as $user) {
+                    echo $user->posts;
+                }
+            }
+
+            public function aliasedQuery()
+            {
+                $query = User::query()->with('posts');
+                $users = $query->get();
+                $items = $users;
+
+                foreach ($items as $item) {
+                    echo $item->posts;
+                }
+            }
+        }
+        PHP;
+
+        $analyzer = new PhpLoopAnalyzer($this->makeRegistry());
+        $issues = $analyzer->analyze('app/Http/Controllers/UserController.php', $code);
+
+        $this->assertCount(1, $issues);
+        $this->assertSame(14, $issues[0]->line);
+        $this->assertSame('posts', $issues[0]->relation);
+    }
+
+    public function test_merges_conditional_branches_using_intersection_of_eager_loads(): void
+    {
+        $code = <<<'PHP'
+        <?php
+        namespace App\Http\Controllers;
+
+        use App\Models\User;
+
+        class UserController
+        {
+            public function partialEagerLoad(bool $flag)
+            {
+                if ($flag) {
+                    $users = User::with('posts')->get();
+                } else {
+                    $users = User::all();
+                }
+
+                foreach ($users as $user) {
+                    echo $user->posts;
+                }
+            }
+
+            public function fullEagerLoad(bool $flag)
+            {
+                if ($flag) {
+                    $users = User::with('posts')->get();
+                } else {
+                    $users = User::query()->with('posts')->get();
+                }
+
+                foreach ($users as $user) {
+                    echo $user->posts;
+                }
+            }
+        }
+        PHP;
+
+        $analyzer = new PhpLoopAnalyzer($this->makeRegistry());
+        $issues = $analyzer->analyze('app/Http/Controllers/UserController.php', $code);
+
+        $this->assertCount(1, $issues);
+        $this->assertSame(17, $issues[0]->line);
+    }
 }

@@ -8,11 +8,8 @@ use PhpParser\Node;
 
 final class ScopeContext
 {
-    /** @var array<string, string> Map of variableName => ModelClass (FQN or short name) */
-    private array $variableModels = [];
-
-    /** @var array<string, list<string>> Map of variableName => list of eager-loaded relation paths */
-    private array $variableEagerLoads = [];
+    /** @var array<string, VariableState> Map of variableName => VariableState */
+    private array $variables = [];
 
     public function __construct(
         private readonly ModelRegistry $modelRegistry,
@@ -20,12 +17,13 @@ final class ScopeContext
 
     public function setVariableModel(string $varName, string $modelClass): void
     {
-        $this->variableModels[$varName] = $modelClass;
+        $existing = $this->variables[$varName] ?? new VariableState;
+        $this->variables[$varName] = new VariableState($modelClass, $existing->eagerLoads);
     }
 
     public function getVariableModel(string $varName): ?string
     {
-        return $this->variableModels[$varName] ?? null;
+        return isset($this->variables[$varName]) ? $this->variables[$varName]->model : null;
     }
 
     /**
@@ -33,8 +31,8 @@ final class ScopeContext
      */
     public function addEagerLoads(string $varName, array $relations): void
     {
-        $existing = $this->variableEagerLoads[$varName] ?? [];
-        $this->variableEagerLoads[$varName] = array_values(array_unique([...$existing, ...$relations]));
+        $existing = $this->variables[$varName] ?? new VariableState;
+        $this->variables[$varName] = $existing->withAddedEagerLoads($relations);
     }
 
     /**
@@ -42,18 +40,33 @@ final class ScopeContext
      */
     public function getEagerLoads(string $varName): array
     {
-        return $this->variableEagerLoads[$varName] ?? [];
+        return isset($this->variables[$varName]) ? $this->variables[$varName]->eagerLoads : [];
+    }
+
+    public function getVariableState(string $varName): ?VariableState
+    {
+        return $this->variables[$varName] ?? null;
+    }
+
+    public function setVariableState(string $varName, ?VariableState $state): void
+    {
+        if ($state === null || ($state->model === null && $state->eagerLoads === [])) {
+            unset($this->variables[$varName]);
+
+            return;
+        }
+
+        $this->variables[$varName] = $state;
     }
 
     public function isRelationEagerLoaded(string $varName, string $relation): bool
     {
-        foreach ($this->getEagerLoads($varName) as $loaded) {
-            if ($loaded === $relation || str_starts_with($loaded, $relation.'.')) {
-                return true;
-            }
+        $state = $this->variables[$varName] ?? null;
+        if ($state !== null && $state->hasEagerLoad($relation)) {
+            return true;
         }
 
-        $modelName = $this->getVariableModel($varName);
+        $modelName = $state?->model;
         if ($modelName !== null) {
             $model = $this->modelRegistry->findByClassName($modelName);
             if ($model !== null && $model->isDefaultEagerLoaded($relation)) {
@@ -69,26 +82,74 @@ final class ScopeContext
      */
     public function processStatement(Node $stmt): void
     {
-        if ($stmt instanceof Node\Stmt\Expression) {
-            $expr = $stmt->expr;
+        if (! $stmt instanceof Node\Stmt\Expression) {
+            return;
+        }
 
-            if ($expr instanceof Node\Expr\Assign && $expr->var instanceof Node\Expr\Variable && is_string($expr->var->name)) {
-                $targetVar = $expr->var->name;
-                $info = $this->inspectCollectionExpression($expr->expr);
-                if ($info['model'] !== null) {
-                    $this->setVariableModel($targetVar, $info['model']);
-                }
-                if ($info['with'] !== []) {
-                    $this->addEagerLoads($targetVar, $info['with']);
-                }
-            } elseif ($expr instanceof Node\Expr\MethodCall) {
-                $this->processLoadCall($expr);
+        $expr = $stmt->expr;
+
+        if ($expr instanceof Node\Expr\Assign && $expr->var instanceof Node\Expr\Variable && is_string($expr->var->name)) {
+            $targetVar = $expr->var->name;
+            $info = $this->inspectCollectionExpression($expr->expr);
+
+            // Reassignment always replaces any previous state for $targetVar.
+            if ($info['model'] === null && $info['with'] === []) {
+                unset($this->variables[$targetVar]);
+            } else {
+                $this->variables[$targetVar] = new VariableState($info['model'], $info['with']);
             }
+        } elseif ($expr instanceof Node\Expr\MethodCall) {
+            $this->processLoadCall($expr);
         }
     }
 
     /**
-     * Inspect an expression such as `User::with('posts')->get()` or `$users`.
+     * Merge multiple control-flow branch scopes (e.g. if / elseif / else) back into this scope.
+     *
+     * @param  non-empty-list<ScopeContext>  $branches
+     */
+    public function mergeBranches(array $branches): void
+    {
+        $allVarNames = [];
+        foreach ($branches as $branch) {
+            foreach (array_keys($branch->variables) as $varName) {
+                $allVarNames[$varName] = true;
+            }
+        }
+
+        $merged = [];
+        foreach (array_keys($allVarNames) as $varName) {
+            $states = array_map(
+                static fn (ScopeContext $branch): ?VariableState => $branch->getVariableState($varName),
+                $branches
+            );
+
+            // Model is kept only if all branches agree on the same non-null model.
+            $models = array_unique(array_map(
+                static fn (?VariableState $s): string => $s?->model ?? '',
+                $states
+            ));
+            $agreedModel = (count($models) === 1 && $models[0] !== '') ? $models[0] : null;
+
+            // Eager loads are guaranteed only if present in every branch (intersection).
+            $eagerLoadLists = array_map(
+                static fn (?VariableState $s): array => $s?->eagerLoads ?? [],
+                $states
+            );
+            $commonEagerLoads = count($eagerLoadLists) === 1
+                ? $eagerLoadLists[0]
+                : array_values(array_intersect(...$eagerLoadLists));
+
+            if ($agreedModel !== null || $commonEagerLoads !== []) {
+                $merged[$varName] = new VariableState($agreedModel, $commonEagerLoads);
+            }
+        }
+
+        $this->variables = $merged;
+    }
+
+    /**
+     * Inspect an expression such as `User::with('posts')->get()`, `$query->get()`, or `$users`.
      *
      * @return array{model: ?string, with: list<string>}
      */
@@ -172,15 +233,10 @@ final class ScopeContext
         $child = clone $this;
         $info = $this->inspectCollectionExpression($iteratedExpr);
 
-        if ($info['model'] !== null) {
-            $child->setVariableModel($itemVarName, $info['model']);
-        }
-
-        if ($info['with'] !== []) {
-            $child->variableEagerLoads[$itemVarName] = $info['with'];
-        } else {
-            unset($child->variableEagerLoads[$itemVarName]);
-        }
+        $child->setVariableState(
+            $itemVarName,
+            new VariableState($info['model'], $info['with'])
+        );
 
         return $child;
     }

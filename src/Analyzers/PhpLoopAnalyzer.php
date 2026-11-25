@@ -134,19 +134,31 @@ final class PhpLoopAnalyzer implements AnalyzerInterface
             }
 
             if ($stmt instanceof Node\Stmt\If_) {
+                $branchScopes = [];
+
                 $guardedRelations = $this->extractRelationLoadedGuards($stmt->cond);
                 $ifScope = clone $scope;
                 foreach ($guardedRelations as [$varName, $relation]) {
                     $ifScope->addEagerLoads($varName, [$relation]);
                 }
                 $this->scanStatements($stmt->stmts, $ifScope, $filePath, $content, $inLoop, $issues);
+                $branchScopes[] = $ifScope;
 
                 foreach ($stmt->elseifs as $elseif) {
-                    $this->scanStatements($elseif->stmts, clone $scope, $filePath, $content, $inLoop, $issues);
+                    $elseifScope = clone $scope;
+                    $this->scanStatements($elseif->stmts, $elseifScope, $filePath, $content, $inLoop, $issues);
+                    $branchScopes[] = $elseifScope;
                 }
+
                 if ($stmt->else !== null) {
-                    $this->scanStatements($stmt->else->stmts, clone $scope, $filePath, $content, $inLoop, $issues);
+                    $elseScope = clone $scope;
+                    $this->scanStatements($stmt->else->stmts, $elseScope, $filePath, $content, $inLoop, $issues);
+                    $branchScopes[] = $elseScope;
+                } else {
+                    $branchScopes[] = clone $scope;
                 }
+
+                $scope->mergeBranches($branchScopes);
 
                 continue;
             }
