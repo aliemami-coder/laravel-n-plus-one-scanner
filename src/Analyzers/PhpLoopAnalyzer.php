@@ -2,6 +2,7 @@
 
 namespace NPlusOneScanner\Analyzers;
 
+use NPlusOneScanner\Analysis\RelationGuardAnalyzer;
 use NPlusOneScanner\Analysis\ScopeContext;
 use NPlusOneScanner\Contracts\AstAnalyzerInterface;
 use NPlusOneScanner\Data\Issue;
@@ -44,6 +45,7 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
         private readonly ModelRegistry $modelRegistry,
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
         private readonly ParsedFileCache $parsedFileCache = new ParsedFileCache,
+        private readonly RelationGuardAnalyzer $guardAnalyzer = new RelationGuardAnalyzer,
     ) {}
 
     public function analyze(string $filePath, string $content): array
@@ -142,8 +144,9 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
             if ($stmt instanceof Node\Stmt\If_) {
                 $scope->processStatement($stmt);
                 $branchScopes = [];
+                $targetResolver = static fn (Node\Expr $expr): ?string => ($expr instanceof Node\Expr\Variable && is_string($expr->name)) ? $expr->name : null;
 
-                $guardedRelations = $this->extractRelationLoadedGuards($stmt->cond);
+                $guardedRelations = $this->guardAnalyzer->extractPositiveGuards($stmt->cond, $targetResolver);
                 $ifScope = clone $scope;
                 foreach ($guardedRelations as [$varName, $relation]) {
                     $ifScope->addEagerLoads($varName, [$relation]);
@@ -153,12 +156,18 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
 
                 foreach ($stmt->elseifs as $elseif) {
                     $elseifScope = clone $scope;
+                    foreach ($this->guardAnalyzer->extractPositiveGuards($elseif->cond, $targetResolver) as [$varName, $relation]) {
+                        $elseifScope->addEagerLoads($varName, [$relation]);
+                    }
                     $this->scanStatements($elseif->stmts, $elseifScope, $filePath, $content, $inLoop, $issues);
                     $branchScopes[] = $elseifScope;
                 }
 
                 if ($stmt->else !== null) {
                     $elseScope = clone $scope;
+                    foreach ($this->guardAnalyzer->extractNegativeGuards($stmt->cond, $targetResolver) as [$varName, $relation]) {
+                        $elseScope->addEagerLoads($varName, [$relation]);
+                    }
                     $this->scanStatements($stmt->else->stmts, $elseScope, $filePath, $content, $inLoop, $issues);
                     $branchScopes[] = $elseScope;
                 } else {
@@ -166,6 +175,12 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
                 }
 
                 $scope->mergeBranches($branchScopes);
+
+                if ($stmt->else === null && $stmt->elseifs === [] && $this->alwaysTerminates($stmt->stmts, $inLoop)) {
+                    foreach ($this->guardAnalyzer->extractNegativeGuards($stmt->cond, $targetResolver) as [$varName, $relation]) {
+                        $scope->addEagerLoads($varName, [$relation]);
+                    }
+                }
 
                 continue;
             }
@@ -434,28 +449,19 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
     }
 
     /**
-     * @return list<array{0: string, 1: string}>
+     * @param  array<Node\Stmt>  $stmts
      */
-    private function extractRelationLoadedGuards(Node\Expr $cond): array
+    private function alwaysTerminates(array $stmts, bool $inLoop): bool
     {
-        $guards = [];
-        $nodeFinder = new NodeFinder;
-        /** @var list<Node\Expr\MethodCall> $calls */
-        $calls = $nodeFinder->findInstanceOf([$cond], Node\Expr\MethodCall::class);
-
-        foreach ($calls as $call) {
-            if ($call->var instanceof Node\Expr\Variable
-                && is_string($call->var->name)
-                && $call->name instanceof Node\Identifier
-                && $call->name->toString() === 'relationLoaded'
-            ) {
-                $first = $call->args[0] ?? null;
-                if ($first instanceof Node\Arg && $first->value instanceof Node\Scalar\String_) {
-                    $guards[] = [$call->var->name, $first->value->value];
-                }
+        foreach ($stmts as $stmt) {
+            if ($stmt instanceof Node\Stmt\Return_ || $stmt instanceof Node\Stmt\Throw_) {
+                return true;
+            }
+            if ($inLoop && ($stmt instanceof Node\Stmt\Continue_ || $stmt instanceof Node\Stmt\Break_)) {
+                return true;
             }
         }
 
-        return $guards;
+        return false;
     }
 }

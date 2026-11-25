@@ -2,6 +2,7 @@
 
 namespace NPlusOneScanner\Analyzers;
 
+use NPlusOneScanner\Analysis\RelationGuardAnalyzer;
 use NPlusOneScanner\Contracts\AstAnalyzerInterface;
 use NPlusOneScanner\Data\Issue;
 use NPlusOneScanner\Data\ParsedFile;
@@ -22,6 +23,7 @@ final class ApiResourceAnalyzer implements AstAnalyzerInterface
         private readonly ModelRegistry $modelRegistry,
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
         private readonly ParsedFileCache $parsedFileCache = new ParsedFileCache,
+        private readonly RelationGuardAnalyzer $guardAnalyzer = new RelationGuardAnalyzer,
     ) {}
 
     public function analyze(string $filePath, string $content): array
@@ -132,7 +134,11 @@ final class ApiResourceAnalyzer implements AstAnalyzerInterface
                 }
 
                 if ($stmt->else !== null) {
-                    $this->scanStatements($stmt->else->stmts, $guarded, $inferredModel, $filePath, $content, $issues);
+                    $elseGuarded = $guarded;
+                    foreach ($this->extractGuards($stmt->cond, negated: true) as $rel) {
+                        $elseGuarded[$rel] = true;
+                    }
+                    $this->scanStatements($stmt->else->stmts, $elseGuarded, $inferredModel, $filePath, $content, $issues);
                 }
 
                 // Early-return negative guard: if (! $this->relationLoaded('rel')) { return ...; }
@@ -260,39 +266,16 @@ final class ApiResourceAnalyzer implements AstAnalyzerInterface
     }
 
     /**
-     * Extract relation names from `$this->relationLoaded('rel')` or `! $this->relationLoaded('rel')`.
-     *
      * @return list<string>
      */
     private function extractGuards(Node $expr, bool $negated): array
     {
-        if ($negated) {
-            if ($expr instanceof Node\Expr\BooleanNot) {
-                return $this->extractGuards($expr->expr, negated: false);
-            }
+        $resolver = fn (Node\Expr $target): ?string => $this->isThisOrResource($target) ? 'this' : null;
+        $pairs = $negated
+            ? $this->guardAnalyzer->extractNegativeGuards($expr, $resolver)
+            : $this->guardAnalyzer->extractPositiveGuards($expr, $resolver);
 
-            return [];
-        }
-
-        if ($expr instanceof Node\Expr\MethodCall
-            && $this->isThisOrResource($expr->var)
-            && $expr->name instanceof Node\Identifier
-            && $expr->name->toString() === 'relationLoaded'
-        ) {
-            $first = $expr->args[0] ?? null;
-            if ($first instanceof Node\Arg && $first->value instanceof Node\Scalar\String_) {
-                return [$first->value->value];
-            }
-        }
-
-        if ($expr instanceof Node\Expr\BinaryOp\BooleanAnd) {
-            return array_values(array_unique([
-                ...$this->extractGuards($expr->left, negated: false),
-                ...$this->extractGuards($expr->right, negated: false),
-            ]));
-        }
-
-        return [];
+        return array_map(static fn (array $pair): string => $pair[1], $pairs);
     }
 
     /**

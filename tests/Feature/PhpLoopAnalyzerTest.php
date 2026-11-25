@@ -229,4 +229,52 @@ class PhpLoopAnalyzerTest extends TestCase
         $this->assertStringContainsString("withCount('posts')", $issues[2]->suggestion);
         $this->assertStringContainsString("withSum('orders', 'column')", $issues[3]->suggestion);
     }
+
+    public function test_handles_positive_and_negative_relation_loaded_guards_in_loops(): void
+    {
+        $code = <<<'PHP'
+        <?php
+        namespace App\Http\Controllers;
+
+        use App\Models\User;
+
+        class UserController
+        {
+            public function index(bool $condition)
+            {
+                $users = User::all();
+                foreach ($users as $user) {
+                    if (! $user->relationLoaded('posts')) {
+                        echo $user->posts; // NOT safe (line 13)
+                    }
+
+                    if ($user->relationLoaded('posts') === false) {
+                        echo $user->posts; // NOT safe (line 17)
+                    }
+
+                    if (! $user->relationLoaded('posts') && $condition) {
+                        echo $user->posts; // NOT safe (line 21)
+                    }
+
+                    if ($user->relationLoaded('posts')) {
+                        echo $user->posts; // safe
+                    }
+
+                    if (! $user->relationLoaded('posts')) {
+                        continue;
+                    }
+                    echo $user->posts; // safe due to early continue
+                }
+            }
+        }
+        PHP;
+
+        $analyzer = new PhpLoopAnalyzer($this->makeRegistry());
+        $issues = $analyzer->analyze('app/Http/Controllers/UserController.php', $code);
+
+        $this->assertCount(3, $issues);
+        $this->assertSame(13, $issues[0]->line);
+        $this->assertSame(17, $issues[1]->line);
+        $this->assertSame(21, $issues[2]->line);
+    }
 }
