@@ -1,5 +1,5 @@
 {
-    "name": "ali/laravel-n-plus-one-scanner",
+    "name": "aliemami-coder/laravel-n-plus-one-scanner",
     "description": "Static AST analyzer package for Laravel to scan an entire project and detect N+1 query issues.",
     "type": "library",
     "license": "MIT",
