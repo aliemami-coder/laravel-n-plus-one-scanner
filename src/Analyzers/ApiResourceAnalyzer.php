@@ -44,46 +44,7 @@ final class ApiResourceAnalyzer implements AnalyzerInterface
             }
 
             $inferredModel = $this->inferModelFromResource($class);
-            $safeNodeIds = $this->collectSafeNodesInsideWhenLoaded($toArray->stmts, $nodeFinder);
-            $guardedRelations = $this->collectMethodLevelGuards($toArray->stmts, $nodeFinder);
-
-            /** @var list<Node\Expr\PropertyFetch> $propFetches */
-            $propFetches = $nodeFinder->findInstanceOf($toArray->stmts, Node\Expr\PropertyFetch::class);
-
-            foreach ($propFetches as $fetch) {
-                if (isset($safeNodeIds[spl_object_id($fetch)])) {
-                    continue;
-                }
-
-                if (! $this->isThisOrResource($fetch->var) || ! $fetch->name instanceof Node\Identifier) {
-                    continue;
-                }
-
-                $relationName = $fetch->name->toString();
-                if (in_array($relationName, $guardedRelations, true)) {
-                    continue;
-                }
-
-                $resolved = $this->resolveRelation($inferredModel, $relationName);
-                if ($resolved === null) {
-                    continue;
-                }
-
-                [$modelName, $severity] = $resolved;
-                $line = $fetch->getStartLine();
-
-                $issues[] = new Issue(
-                    file: $filePath,
-                    line: $line,
-                    type: Issue::TYPE_MISSING_WHEN_LOADED,
-                    severity: $severity,
-                    model: $modelName,
-                    relation: $relationName,
-                    message: "API Resource accesses `\$this->{$relationName}` without `whenLoaded('{$relationName}')`, risking N+1 queries on collections.",
-                    suggestion: "Use `\$this->whenLoaded('{$relationName}')` or guard with `\$this->relationLoaded('{$relationName}')`.",
-                    snippet: PhpParserHelper::getLineSnippet($content, $line),
-                );
-            }
+            $this->scanStatements($toArray->stmts, [], $inferredModel, $filePath, $content, $issues);
         }
 
         return $issues;
@@ -125,78 +86,216 @@ final class ApiResourceAnalyzer implements AnalyzerInterface
     }
 
     /**
-     * Collect object IDs of PropertyFetch nodes that sit inside `$this->whenLoaded(...)`
-     * or `$this->when($this->relationLoaded(...), ...)`.
+     * Walk statements with scoped relationLoaded() guards.
      *
-     * @param  list<Node\Stmt>  $stmts
-     * @return array<int, true>
+     * @param  array<Node>  $stmts
+     * @param  array<string, true>  $guarded
+     * @param  list<Issue>  $issues
      */
-    private function collectSafeNodesInsideWhenLoaded(array $stmts, NodeFinder $nodeFinder): array
-    {
-        $safeIds = [];
-        /** @var list<Node\Expr\MethodCall> $calls */
-        $calls = $nodeFinder->findInstanceOf($stmts, Node\Expr\MethodCall::class);
+    private function scanStatements(
+        array $stmts,
+        array $guarded,
+        ?string $inferredModel,
+        string $filePath,
+        string $content,
+        array &$issues,
+    ): void {
+        foreach ($stmts as $stmt) {
+            if ($stmt instanceof Node\Stmt\If_) {
+                $this->scanNode($stmt->cond, $guarded, $inferredModel, $filePath, $content, $issues);
 
-        foreach ($calls as $call) {
-            if (! $this->isThisOrResource($call->var) || ! $call->name instanceof Node\Identifier) {
+                $positiveGuards = $this->extractGuards($stmt->cond, negated: false);
+                $ifGuarded = $guarded;
+                foreach ($positiveGuards as $rel) {
+                    $ifGuarded[$rel] = true;
+                }
+                $this->scanStatements($stmt->stmts, $ifGuarded, $inferredModel, $filePath, $content, $issues);
+
+                foreach ($stmt->elseifs as $elseif) {
+                    $this->scanNode($elseif->cond, $guarded, $inferredModel, $filePath, $content, $issues);
+                    $elseifGuarded = $guarded;
+                    foreach ($this->extractGuards($elseif->cond, negated: false) as $rel) {
+                        $elseifGuarded[$rel] = true;
+                    }
+                    $this->scanStatements($elseif->stmts, $elseifGuarded, $inferredModel, $filePath, $content, $issues);
+                }
+
+                if ($stmt->else !== null) {
+                    $this->scanStatements($stmt->else->stmts, $guarded, $inferredModel, $filePath, $content, $issues);
+                }
+
+                // Early-return negative guard: if (! $this->relationLoaded('rel')) { return ...; }
+                if ($stmt->else === null && $stmt->elseifs === [] && $this->alwaysTerminates($stmt->stmts)) {
+                    foreach ($this->extractGuards($stmt->cond, negated: true) as $rel) {
+                        $guarded[$rel] = true;
+                    }
+                }
+
                 continue;
             }
 
-            $methodName = $call->name->toString();
-            $isSafeWrapper = $methodName === 'whenLoaded'
-                || ($methodName === 'when' && $this->containsRelationLoaded($call->args[0] ?? null, $nodeFinder));
-
-            if (! $isSafeWrapper) {
-                continue;
-            }
-
-            /** @var list<Node\Expr\PropertyFetch> $innerFetches */
-            $innerFetches = $nodeFinder->findInstanceOf($call->args, Node\Expr\PropertyFetch::class);
-            foreach ($innerFetches as $inner) {
-                $safeIds[spl_object_id($inner)] = true;
-            }
+            $this->scanNode($stmt, $guarded, $inferredModel, $filePath, $content, $issues);
         }
-
-        return $safeIds;
     }
 
-    private function containsRelationLoaded(?Node $node, NodeFinder $nodeFinder): bool
-    {
-        if ($node === null) {
-            return false;
+    /**
+     * Recursively inspect a node for unguarded `$this->relation` / `$this->resource->relation` accesses.
+     *
+     * @param  array<string, true>  $guarded
+     * @param  list<Issue>  $issues
+     */
+    private function scanNode(
+        Node $node,
+        array $guarded,
+        ?string $inferredModel,
+        string $filePath,
+        string $content,
+        array &$issues,
+    ): void {
+        if ($node instanceof Node\Expr\MethodCall
+            && $this->isThisOrResource($node->var)
+            && $node->name instanceof Node\Identifier
+        ) {
+            $methodName = $node->name->toString();
+            if ($methodName === 'whenLoaded') {
+                return;
+            }
+            if ($methodName === 'when') {
+                $firstArg = $node->args[0] ?? null;
+                if ($firstArg instanceof Node\Arg) {
+                    $whenGuarded = $guarded;
+                    foreach ($this->extractGuards($firstArg->value, negated: false) as $rel) {
+                        $whenGuarded[$rel] = true;
+                    }
+                    foreach (array_slice($node->args, 1) as $arg) {
+                        $this->scanNode($arg, $whenGuarded, $inferredModel, $filePath, $content, $issues);
+                    }
+
+                    return;
+                }
+            }
         }
 
-        /** @var list<Node\Expr\MethodCall> $calls */
-        $calls = $nodeFinder->findInstanceOf([$node], Node\Expr\MethodCall::class);
-        foreach ($calls as $call) {
-            if ($call->name instanceof Node\Identifier && $call->name->toString() === 'relationLoaded') {
+        if ($node instanceof Node\Expr\Ternary) {
+            $this->scanNode($node->cond, $guarded, $inferredModel, $filePath, $content, $issues);
+
+            if ($node->if !== null) {
+                $ifGuarded = $guarded;
+                foreach ($this->extractGuards($node->cond, negated: false) as $rel) {
+                    $ifGuarded[$rel] = true;
+                }
+                $this->scanNode($node->if, $ifGuarded, $inferredModel, $filePath, $content, $issues);
+            }
+
+            $elseGuarded = $guarded;
+            foreach ($this->extractGuards($node->cond, negated: true) as $rel) {
+                $elseGuarded[$rel] = true;
+            }
+            $this->scanNode($node->else, $elseGuarded, $inferredModel, $filePath, $content, $issues);
+
+            return;
+        }
+
+        if ($node instanceof Node\Expr\BinaryOp\BooleanAnd) {
+            $this->scanNode($node->left, $guarded, $inferredModel, $filePath, $content, $issues);
+            $rightGuarded = $guarded;
+            foreach ($this->extractGuards($node->left, negated: false) as $rel) {
+                $rightGuarded[$rel] = true;
+            }
+            $this->scanNode($node->right, $rightGuarded, $inferredModel, $filePath, $content, $issues);
+
+            return;
+        }
+
+        if ($node instanceof Node\Expr\PropertyFetch
+            && $this->isThisOrResource($node->var)
+            && $node->name instanceof Node\Identifier
+        ) {
+            $relationName = $node->name->toString();
+            if (! isset($guarded[$relationName])) {
+                $resolved = $this->resolveRelation($inferredModel, $relationName);
+                if ($resolved !== null) {
+                    [$modelName, $severity] = $resolved;
+                    $line = $node->getStartLine();
+                    $issues[] = new Issue(
+                        file: $filePath,
+                        line: $line,
+                        type: Issue::TYPE_MISSING_WHEN_LOADED,
+                        severity: $severity,
+                        model: $modelName,
+                        relation: $relationName,
+                        message: "API Resource accesses `\$this->{$relationName}` without `whenLoaded('{$relationName}')`, risking N+1 queries on collections.",
+                        suggestion: "Use `\$this->whenLoaded('{$relationName}')` or guard with `\$this->relationLoaded('{$relationName}')`.",
+                        snippet: PhpParserHelper::getLineSnippet($content, $line),
+                    );
+                }
+            }
+
+            return;
+        }
+
+        foreach ($node->getSubNodeNames() as $subName) {
+            $sub = $node->{$subName};
+            if ($sub instanceof Node) {
+                $this->scanNode($sub, $guarded, $inferredModel, $filePath, $content, $issues);
+            } elseif (is_array($sub)) {
+                foreach ($sub as $item) {
+                    if ($item instanceof Node) {
+                        $this->scanNode($item, $guarded, $inferredModel, $filePath, $content, $issues);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Extract relation names from `$this->relationLoaded('rel')` or `! $this->relationLoaded('rel')`.
+     *
+     * @return list<string>
+     */
+    private function extractGuards(Node $expr, bool $negated): array
+    {
+        if ($negated) {
+            if ($expr instanceof Node\Expr\BooleanNot) {
+                return $this->extractGuards($expr->expr, negated: false);
+            }
+
+            return [];
+        }
+
+        if ($expr instanceof Node\Expr\MethodCall
+            && $this->isThisOrResource($expr->var)
+            && $expr->name instanceof Node\Identifier
+            && $expr->name->toString() === 'relationLoaded'
+        ) {
+            $first = $expr->args[0] ?? null;
+            if ($first instanceof Node\Arg && $first->value instanceof Node\Scalar\String_) {
+                return [$first->value->value];
+            }
+        }
+
+        if ($expr instanceof Node\Expr\BinaryOp\BooleanAnd) {
+            return array_values(array_unique([
+                ...$this->extractGuards($expr->left, negated: false),
+                ...$this->extractGuards($expr->right, negated: false),
+            ]));
+        }
+
+        return [];
+    }
+
+    /**
+     * @param  array<Node\Stmt>  $stmts
+     */
+    private function alwaysTerminates(array $stmts): bool
+    {
+        foreach ($stmts as $stmt) {
+            if ($stmt instanceof Node\Stmt\Return_ || $stmt instanceof Node\Stmt\Throw_) {
                 return true;
             }
         }
 
         return false;
-    }
-
-    /**
-     * @param  list<Node\Stmt>  $stmts
-     * @return list<string>
-     */
-    private function collectMethodLevelGuards(array $stmts, NodeFinder $nodeFinder): array
-    {
-        $guarded = [];
-        /** @var list<Node\Expr\MethodCall> $calls */
-        $calls = $nodeFinder->findInstanceOf($stmts, Node\Expr\MethodCall::class);
-
-        foreach ($calls as $call) {
-            if ($call->name instanceof Node\Identifier && $call->name->toString() === 'relationLoaded') {
-                $first = $call->args[0] ?? null;
-                if ($first instanceof Node\Arg && $first->value instanceof Node\Scalar\String_) {
-                    $guarded[] = $first->value->value;
-                }
-            }
-        }
-
-        return $guarded;
     }
 
     private function isThisOrResource(Node\Expr $expr): bool
