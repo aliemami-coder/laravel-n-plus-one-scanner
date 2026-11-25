@@ -3,14 +3,16 @@
 namespace NPlusOneScanner\Analyzers;
 
 use NPlusOneScanner\Analysis\ScopeContext;
-use NPlusOneScanner\Contracts\AnalyzerInterface;
+use NPlusOneScanner\Contracts\AstAnalyzerInterface;
 use NPlusOneScanner\Data\Issue;
+use NPlusOneScanner\Data\ParsedFile;
 use NPlusOneScanner\Discovery\ModelRegistry;
+use NPlusOneScanner\Support\ParsedFileCache;
 use NPlusOneScanner\Support\PhpParserHelper;
 use PhpParser\Node;
 use PhpParser\NodeFinder;
 
-final class PhpLoopAnalyzer implements AnalyzerInterface
+final class PhpLoopAnalyzer implements AstAnalyzerInterface
 {
     private const COLLECTION_LOOP_METHODS = [
         'each',
@@ -28,14 +30,23 @@ final class PhpLoopAnalyzer implements AnalyzerInterface
     public function __construct(
         private readonly ModelRegistry $modelRegistry,
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
+        private readonly ParsedFileCache $parsedFileCache = new ParsedFileCache,
     ) {}
 
     public function analyze(string $filePath, string $content): array
     {
-        $ast = $this->parserHelper->parse($content);
+        return $this->analyzeParsed($this->parsedFileCache->fromContent($filePath, $content));
+    }
+
+    public function analyzeParsed(ParsedFile $parsedFile): array
+    {
+        $ast = $parsedFile->ast;
         if ($ast === null) {
             return [];
         }
+
+        $filePath = $parsedFile->path;
+        $content = $parsedFile->content;
 
         $issues = [];
         $nodeFinder = new NodeFinder;

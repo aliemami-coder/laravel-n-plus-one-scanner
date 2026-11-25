@@ -8,11 +8,13 @@ use NPlusOneScanner\Analyzers\DirectQueryInLoopAnalyzer;
 use NPlusOneScanner\Analyzers\PhpLoopAnalyzer;
 use NPlusOneScanner\Analyzers\RelationshipQueryChainAnalyzer;
 use NPlusOneScanner\Data\Issue;
+use NPlusOneScanner\Data\ParsedFile;
 use NPlusOneScanner\Data\ScanResult;
 use NPlusOneScanner\Discovery\ControllerViewMap;
 use NPlusOneScanner\Discovery\ModelRegistry;
 use NPlusOneScanner\Support\BaselineManager;
 use NPlusOneScanner\Support\IgnoreFilter;
+use NPlusOneScanner\Support\ParsedFileCache;
 use NPlusOneScanner\Support\PhpParserHelper;
 use RecursiveDirectoryIterator;
 use RecursiveIteratorIterator;
@@ -36,13 +38,17 @@ final class Scanner
         $basePath = rtrim($basePath, '/\\');
 
         $parserHelper = new PhpParserHelper;
-        $modelRegistry = new ModelRegistry($parserHelper);
+        $parsedFileCache = ($options['parsed_file_cache'] ?? null) instanceof ParsedFileCache
+            ? $options['parsed_file_cache']
+            : new ParsedFileCache($parserHelper);
+
+        $modelRegistry = new ModelRegistry($parserHelper, $parsedFileCache);
 
         $modelDirs = $this->resolvePaths($basePath, $this->config['model_paths'] ?? ['app/Models']);
         $appPaths = $this->resolvePaths($basePath, ['app', 'routes']);
         $modelRegistry->discover($modelDirs, $this->resolvePaths($basePath, ['app']));
 
-        $controllerViewMap = new ControllerViewMap($modelRegistry, $parserHelper);
+        $controllerViewMap = new ControllerViewMap($modelRegistry, $parserHelper, $parsedFileCache);
         $controllerViewMap->discover($appPaths);
 
         $analyzersConfig = $this->config['analyzers'] ?? [];
@@ -54,16 +60,16 @@ final class Scanner
 
         $phpAnalyzers = [];
         if ($enablePhpLoops) {
-            $phpAnalyzers[] = new PhpLoopAnalyzer($modelRegistry, $parserHelper);
+            $phpAnalyzers[] = new PhpLoopAnalyzer($modelRegistry, $parserHelper, $parsedFileCache);
         }
         if ($enableRelationshipChains) {
-            $phpAnalyzers[] = new RelationshipQueryChainAnalyzer($modelRegistry, $parserHelper);
+            $phpAnalyzers[] = new RelationshipQueryChainAnalyzer($modelRegistry, $parserHelper, $parsedFileCache);
         }
         if ($enableQueriesInLoops) {
-            $phpAnalyzers[] = new DirectQueryInLoopAnalyzer($modelRegistry, $parserHelper);
+            $phpAnalyzers[] = new DirectQueryInLoopAnalyzer($modelRegistry, $parserHelper, $parsedFileCache);
         }
         if ($enableApiResources) {
-            $phpAnalyzers[] = new ApiResourceAnalyzer($modelRegistry, $parserHelper);
+            $phpAnalyzers[] = new ApiResourceAnalyzer($modelRegistry, $parserHelper, $parsedFileCache);
         }
 
         $bladeAnalyzer = $enableBlade
@@ -79,15 +85,14 @@ final class Scanner
 
         $rawIssues = [];
         foreach ($files as $filePath) {
-            $content = @file_get_contents($filePath);
-            if ($content === false) {
-                continue;
-            }
-
             $relativeFile = $this->makeRelativePath($basePath, $filePath);
 
             if (str_ends_with($filePath, '.blade.php')) {
                 if ($bladeAnalyzer !== null) {
+                    $content = @file_get_contents($filePath);
+                    if ($content === false) {
+                        continue;
+                    }
                     foreach ($bladeAnalyzer->analyze($relativeFile, $content) as $issue) {
                         $rawIssues[] = $this->attachAbsoluteFileForIgnore($issue, $filePath);
                     }
@@ -97,8 +102,13 @@ final class Scanner
             }
 
             if (str_ends_with($filePath, '.php')) {
+                $parsed = $parsedFileCache->get($filePath);
+                if ($parsed === null) {
+                    continue;
+                }
+                $relativeParsed = new ParsedFile($relativeFile, $parsed->content, $parsed->hash, $parsed->ast);
                 foreach ($phpAnalyzers as $analyzer) {
-                    foreach ($analyzer->analyze($relativeFile, $content) as $issue) {
+                    foreach ($analyzer->analyzeParsed($relativeParsed) as $issue) {
                         $rawIssues[] = $this->attachAbsoluteFileForIgnore($issue, $filePath);
                     }
                 }

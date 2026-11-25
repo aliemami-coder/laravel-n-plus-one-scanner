@@ -3,6 +3,7 @@
 namespace NPlusOneScanner\Discovery;
 
 use NPlusOneScanner\Analysis\ScopeContext;
+use NPlusOneScanner\Support\ParsedFileCache;
 use NPlusOneScanner\Support\PhpParserHelper;
 use PhpParser\Node;
 use PhpParser\NodeFinder;
@@ -21,6 +22,7 @@ final class ControllerViewMap
     public function __construct(
         private readonly ModelRegistry $modelRegistry,
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
+        private readonly ParsedFileCache $parsedFileCache = new ParsedFileCache,
     ) {}
 
     /**
@@ -48,15 +50,12 @@ final class ControllerViewMap
 
     public function scanFile(string $filePath): void
     {
-        $code = @file_get_contents($filePath);
-        if ($code === false) {
+        $parsed = $this->parsedFileCache->get($filePath);
+        if ($parsed === null || $parsed->ast === null) {
             return;
         }
 
-        $ast = $this->parserHelper->parse($code);
-        if ($ast === null) {
-            return;
-        }
+        $ast = $parsed->ast;
 
         $nodeFinder = new NodeFinder;
         /** @var list<Node\FunctionLike> $functions */

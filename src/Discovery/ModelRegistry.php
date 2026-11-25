@@ -3,6 +3,7 @@
 namespace NPlusOneScanner\Discovery;
 
 use NPlusOneScanner\Data\ModelDefinition;
+use NPlusOneScanner\Support\ParsedFileCache;
 use NPlusOneScanner\Support\PhpParserHelper;
 use PhpParser\Node;
 use PhpParser\NodeFinder;
@@ -65,6 +66,7 @@ final class ModelRegistry
 
     public function __construct(
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
+        private readonly ParsedFileCache $parsedFileCache = new ParsedFileCache,
     ) {}
 
     /**
@@ -86,15 +88,12 @@ final class ModelRegistry
 
     public function registerFromFile(string $filePath, bool $registerAsModelCandidate = true, bool $resolve = true): void
     {
-        $code = @file_get_contents($filePath);
-        if ($code === false) {
+        $parsed = $this->parsedFileCache->get($filePath);
+        if ($parsed === null || $parsed->ast === null) {
             return;
         }
 
-        $ast = $this->parserHelper->parse($code);
-        if ($ast === null) {
-            return;
-        }
+        $ast = $parsed->ast;
 
         $nodeFinder = new NodeFinder;
 
