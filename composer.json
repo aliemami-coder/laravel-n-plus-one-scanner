@@ -5,7 +5,7 @@
     "license": "MIT",
     "keywords": [
         "laravel",
-        "n+1",
+        "n-plus-one",
         "eloquent",
         "static-analysis",
         "performance",
