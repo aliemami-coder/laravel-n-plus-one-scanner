@@ -66,6 +66,7 @@ return [
     */
     'analyzers' => [
         'php_loops' => true,
+        'relationship_chains' => true,
         'queries_in_loops' => true,
         'api_resources' => true,
         'blade_views' => true,

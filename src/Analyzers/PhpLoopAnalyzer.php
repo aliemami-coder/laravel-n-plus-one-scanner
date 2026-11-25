@@ -25,24 +25,6 @@ final class PhpLoopAnalyzer implements AnalyzerInterface
         'mapWithKeys',
     ];
 
-    private const QUERY_TERMINAL_METHODS = [
-        'get',
-        'first',
-        'firstOrFail',
-        'find',
-        'findOrFail',
-        'count',
-        'exists',
-        'doesntExist',
-        'pluck',
-        'sum',
-        'avg',
-        'min',
-        'max',
-        'value',
-        'paginate',
-    ];
-
     public function __construct(
         private readonly ModelRegistry $modelRegistry,
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
@@ -244,47 +226,7 @@ final class PhpLoopAnalyzer implements AnalyzerInterface
             }
         }
 
-        // 1. Detect $item->relation()->count()/get()/first()/exists() inside loop
-        /** @var list<Node\Expr\MethodCall> $methodCalls */
-        $methodCalls = $nodeFinder->findInstanceOf([$node], Node\Expr\MethodCall::class);
-        foreach ($methodCalls as $call) {
-            if (! $call->name instanceof Node\Identifier) {
-                continue;
-            }
-
-            $terminalName = $call->name->toString();
-            if (! in_array($terminalName, self::QUERY_TERMINAL_METHODS, true)) {
-                continue;
-            }
-
-            if ($call->var instanceof Node\Expr\MethodCall
-                && $call->var->var instanceof Node\Expr\Variable
-                && is_string($call->var->var->name)
-                && $call->var->name instanceof Node\Identifier
-            ) {
-                $varName = $call->var->var->name;
-                $relationName = $call->var->name->toString();
-                $resolved = $this->resolveRelationOwner($varName, $relationName, $scope);
-
-                if ($resolved !== null) {
-                    [$modelName, $severity] = $resolved;
-                    $line = $call->getStartLine();
-                    $issues[] = new Issue(
-                        file: $filePath,
-                        line: $line,
-                        type: Issue::TYPE_LAZY_LOADING_IN_LOOP,
-                        severity: $severity,
-                        model: $modelName,
-                        relation: $relationName,
-                        message: "Calling `->{$relationName}()->{$terminalName}()` inside a loop triggers a SQL query per iteration.",
-                        suggestion: "Eager load `{$relationName}` (or use `withCount('{$relationName}')`) before the loop and access the loaded property/count instead.",
-                        snippet: PhpParserHelper::getLineSnippet($content, $line),
-                    );
-                }
-            }
-        }
-
-        // 2. Detect $item->relation property access inside loop
+        // Detect $item->relation property access inside loop
         /** @var list<Node\Expr\PropertyFetch> $propFetches */
         $propFetches = $nodeFinder->findInstanceOf([$node], Node\Expr\PropertyFetch::class);
         foreach ($propFetches as $fetch) {

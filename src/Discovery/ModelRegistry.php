@@ -57,34 +57,34 @@ final class ModelRegistry
     /** @var array<string, list<ModelDefinition>> Map of relationName => list<ModelDefinition> */
     private array $modelsByRelation = [];
 
+    /** @var array<string, array{relations: array<string, ?string>, defaultWith: list<string>, traits: list<string>}> */
+    private array $traitDefinitions = [];
+
+    /** @var array<string, array{parent: ?string, relations: array<string, ?string>, defaultWith: list<string>, traits: list<string>, file: string, shortName: string, isModel: bool}> */
+    private array $parsedClasses = [];
+
     public function __construct(
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
     ) {}
 
     /**
-     * @param  list<string>  $directories
+     * @param  list<string>  $modelDirectories
+     * @param  list<string>  $supportDirectories  Optional extra directories (e.g. app/) to index traits & base models
      */
-    public function discover(array $directories): void
+    public function discover(array $modelDirectories, array $supportDirectories = []): void
     {
-        foreach ($directories as $directory) {
-            if (! is_dir($directory)) {
-                continue;
-            }
-
-            $iterator = new RecursiveIteratorIterator(
-                new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS)
-            );
-
-            /** @var SplFileInfo $file */
-            foreach ($iterator as $file) {
-                if ($file->isFile() && $file->getExtension() === 'php') {
-                    $this->registerFromFile($file->getPathname());
-                }
-            }
+        foreach ($supportDirectories as $directory) {
+            $this->scanDirectory($directory, registerAsModelCandidate: false);
         }
+
+        foreach ($modelDirectories as $directory) {
+            $this->scanDirectory($directory, registerAsModelCandidate: true);
+        }
+
+        $this->resolveInheritanceAndTraits();
     }
 
-    public function registerFromFile(string $filePath): void
+    public function registerFromFile(string $filePath, bool $registerAsModelCandidate = true, bool $resolve = true): void
     {
         $code = @file_get_contents($filePath);
         if ($code === false) {
@@ -97,29 +97,47 @@ final class ModelRegistry
         }
 
         $nodeFinder = new NodeFinder;
+
+        /** @var list<Node\Stmt\Trait_> $traits */
+        $traits = $nodeFinder->findInstanceOf($ast, Node\Stmt\Trait_::class);
+        foreach ($traits as $trait) {
+            if ($trait->name === null) {
+                continue;
+            }
+            $fqn = ltrim($trait->namespacedName?->toString() ?? $trait->name->toString(), '\\');
+            $this->traitDefinitions[$fqn] = [
+                'relations' => $this->extractRelations($trait),
+                'defaultWith' => $this->extractDefaultWith($trait),
+                'traits' => $this->extractUsedTraits($trait),
+            ];
+        }
+
         /** @var list<Node\Stmt\Class_> $classes */
         $classes = $nodeFinder->findInstanceOf($ast, Node\Stmt\Class_::class);
-
         foreach ($classes as $class) {
-            if ($class->name === null || ! $this->looksLikeModel($class)) {
+            if ($class->name === null) {
                 continue;
             }
 
-            $fqn = $class->namespacedName?->toString() ?? $class->name->toString();
-            $shortName = $class->name->toString();
+            $fqn = ltrim($class->namespacedName?->toString() ?? $class->name->toString(), '\\');
+            $parentFqn = $class->extends !== null
+                ? ltrim(PhpParserHelper::resolveClassName($class->extends) ?? '', '\\')
+                : null;
 
-            $relations = $this->extractRelations($class);
-            $defaultWith = $this->extractDefaultWith($class);
+            $isModel = $registerAsModelCandidate && $this->looksLikeModel($class);
+            $this->parsedClasses[$fqn] = [
+                'parent' => $parentFqn !== '' ? $parentFqn : null,
+                'relations' => $this->extractRelations($class),
+                'defaultWith' => $this->extractDefaultWith($class),
+                'traits' => $this->extractUsedTraits($class),
+                'file' => $filePath,
+                'shortName' => $class->name->toString(),
+                'isModel' => $isModel,
+            ];
+        }
 
-            $definition = new ModelDefinition(
-                fqn: $fqn,
-                shortName: $shortName,
-                file: $filePath,
-                relations: $relations,
-                defaultWith: $defaultWith,
-            );
-
-            $this->register($definition);
+        if ($resolve && $registerAsModelCandidate) {
+            $this->resolveInheritanceAndTraits();
         }
     }
 
@@ -147,7 +165,8 @@ final class ModelRegistry
         $short = PhpParserHelper::shortName($normalized);
         $matches = $this->modelsByShortName[$short] ?? [];
 
-        return count($matches) === 1 ? $matches[0] : ($matches[0] ?? null);
+        // Return null when ambiguous (multiple models share the same short name).
+        return count($matches) === 1 ? $matches[0] : null;
     }
 
     /**
@@ -176,18 +195,147 @@ final class ModelRegistry
         return $this->modelsByFqn;
     }
 
+    private function scanDirectory(string $directory, bool $registerAsModelCandidate): void
+    {
+        if (! is_dir($directory)) {
+            return;
+        }
+
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory, RecursiveDirectoryIterator::SKIP_DOTS)
+        );
+
+        /** @var SplFileInfo $file */
+        foreach ($iterator as $file) {
+            if ($file->isFile() && $file->getExtension() === 'php') {
+                $this->registerFromFile($file->getPathname(), $registerAsModelCandidate, resolve: false);
+            }
+        }
+    }
+
+    private function resolveInheritanceAndTraits(): void
+    {
+        foreach ($this->parsedClasses as $fqn => $info) {
+            if (! $info['isModel'] && ! $this->inheritsFromBaseModel($fqn)) {
+                continue;
+            }
+
+            if (isset($this->modelsByFqn[$fqn])) {
+                continue;
+            }
+
+            $relations = [];
+            $defaultWith = [];
+            $visited = [];
+            $this->collectInheritedMembers($fqn, $relations, $defaultWith, $visited);
+
+            $this->register(new ModelDefinition(
+                fqn: $fqn,
+                shortName: $info['shortName'],
+                file: $info['file'],
+                relations: $relations,
+                defaultWith: array_values(array_unique($defaultWith)),
+            ));
+        }
+    }
+
+    private function inheritsFromBaseModel(string $fqn): bool
+    {
+        $visited = [];
+        $current = $fqn;
+
+        while ($current !== null && ! isset($visited[$current])) {
+            $visited[$current] = true;
+            $parent = $this->parsedClasses[$current]['parent'] ?? null;
+            if ($parent === null) {
+                return false;
+            }
+            if (in_array($parent, self::BASE_MODEL_CLASSES, true)) {
+                return true;
+            }
+            $current = $parent;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, ?string>  $relations
+     * @param  list<string>  $defaultWith
+     * @param  array<string, true>  $visited
+     */
+    private function collectInheritedMembers(string $fqn, array &$relations, array &$defaultWith, array &$visited): void
+    {
+        if (isset($visited[$fqn]) || ! isset($this->parsedClasses[$fqn])) {
+            return;
+        }
+        $visited[$fqn] = true;
+
+        $classInfo = $this->parsedClasses[$fqn];
+        if ($classInfo['parent'] !== null) {
+            $this->collectInheritedMembers($classInfo['parent'], $relations, $defaultWith, $visited);
+        }
+
+        $traitVisited = [];
+        foreach ($classInfo['traits'] as $traitFqn) {
+            $this->collectTraitMembers($traitFqn, $relations, $defaultWith, $traitVisited);
+        }
+
+        foreach ($classInfo['relations'] as $relName => $related) {
+            $relations[$relName] = $related;
+        }
+        $defaultWith = [...$defaultWith, ...$classInfo['defaultWith']];
+    }
+
+    /**
+     * @param  array<string, ?string>  $relations
+     * @param  list<string>  $defaultWith
+     * @param  array<string, true>  $visited
+     */
+    private function collectTraitMembers(string $traitFqn, array &$relations, array &$defaultWith, array &$visited): void
+    {
+        if (isset($visited[$traitFqn])) {
+            return;
+        }
+        $visited[$traitFqn] = true;
+
+        $traitInfo = $this->traitDefinitions[$traitFqn] ?? null;
+        if ($traitInfo === null) {
+            // Fallback to short-name match if namespace differed
+            $short = PhpParserHelper::shortName($traitFqn);
+            foreach ($this->traitDefinitions as $candidateFqn => $candidate) {
+                if (PhpParserHelper::shortName($candidateFqn) === $short) {
+                    $traitInfo = $candidate;
+                    break;
+                }
+            }
+        }
+
+        if ($traitInfo === null) {
+            return;
+        }
+
+        foreach ($traitInfo['traits'] as $nestedTrait) {
+            $this->collectTraitMembers($nestedTrait, $relations, $defaultWith, $visited);
+        }
+
+        foreach ($traitInfo['relations'] as $relName => $related) {
+            $relations[$relName] = $related;
+        }
+        $defaultWith = [...$defaultWith, ...$traitInfo['defaultWith']];
+    }
+
     private function looksLikeModel(Node\Stmt\Class_ $class): bool
     {
         if ($class->extends === null) {
             return false;
         }
 
-        $parentFqn = PhpParserHelper::resolveClassName($class->extends) ?? '';
+        $parentFqn = ltrim(PhpParserHelper::resolveClassName($class->extends) ?? '', '\\');
         if (in_array($parentFqn, self::BASE_MODEL_CLASSES, true)) {
             return true;
         }
 
-        // Also accept classes extending a base Model in the app (e.g., BaseModel) or having relation methods.
         if (str_ends_with($parentFqn, '\\Model') || str_ends_with($parentFqn, 'BaseModel')) {
             return true;
         }
@@ -196,14 +344,35 @@ final class ModelRegistry
     }
 
     /**
+     * @return list<string>
+     */
+    private function extractUsedTraits(Node\Stmt\ClassLike $classLike): array
+    {
+        $traits = [];
+        foreach ($classLike->stmts as $stmt) {
+            if (! $stmt instanceof Node\Stmt\TraitUse) {
+                continue;
+            }
+            foreach ($stmt->traits as $traitName) {
+                $resolved = PhpParserHelper::resolveClassName($traitName);
+                if ($resolved !== null) {
+                    $traits[] = ltrim($resolved, '\\');
+                }
+            }
+        }
+
+        return $traits;
+    }
+
+    /**
      * @return array<string, string|null>
      */
-    private function extractRelations(Node\Stmt\Class_ $class): array
+    private function extractRelations(Node\Stmt\ClassLike $classLike): array
     {
         $relations = [];
         $nodeFinder = new NodeFinder;
 
-        foreach ($class->getMethods() as $method) {
+        foreach ($classLike->getMethods() as $method) {
             if (! $method->isPublic() || $method->isStatic()) {
                 continue;
             }
@@ -222,10 +391,6 @@ final class ModelRegistry
         return $relations;
     }
 
-    /**
-     * Returns string (related model short name), null (relation without resolved target, e.g. morphTo),
-     * or false if the method is not an Eloquent relationship.
-     */
     private function detectRelatedModelFromMethod(Node\Stmt\ClassMethod $method, NodeFinder $nodeFinder): string|null|false
     {
         $hasRelationReturnType = false;
@@ -257,6 +422,10 @@ final class ModelRegistry
                 continue;
             }
 
+            if ($callName === 'morphTo') {
+                return null;
+            }
+
             return $this->extractRelatedModelArg($call);
         }
 
@@ -276,11 +445,11 @@ final class ModelRegistry
         ) {
             $resolved = PhpParserHelper::resolveClassName($firstArg->value->class);
 
-            return $resolved !== null ? PhpParserHelper::shortName($resolved) : null;
+            return $resolved !== null ? ltrim($resolved, '\\') : null;
         }
 
         if ($firstArg->value instanceof Node\Scalar\String_) {
-            return PhpParserHelper::shortName($firstArg->value->value);
+            return ltrim($firstArg->value->value, '\\');
         }
 
         return null;
@@ -302,11 +471,11 @@ final class ModelRegistry
     /**
      * @return list<string>
      */
-    private function extractDefaultWith(Node\Stmt\Class_ $class): array
+    private function extractDefaultWith(Node\Stmt\ClassLike $classLike): array
     {
         $defaultWith = [];
 
-        foreach ($class->getProperties() as $property) {
+        foreach ($classLike->getProperties() as $property) {
             foreach ($property->props as $prop) {
                 if ($prop->name->toString() !== 'with' || ! $prop->default instanceof Node\Expr\Array_) {
                     continue;

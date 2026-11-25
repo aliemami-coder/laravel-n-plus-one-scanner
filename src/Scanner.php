@@ -6,6 +6,7 @@ use NPlusOneScanner\Analyzers\ApiResourceAnalyzer;
 use NPlusOneScanner\Analyzers\BladeViewAnalyzer;
 use NPlusOneScanner\Analyzers\DirectQueryInLoopAnalyzer;
 use NPlusOneScanner\Analyzers\PhpLoopAnalyzer;
+use NPlusOneScanner\Analyzers\RelationshipQueryChainAnalyzer;
 use NPlusOneScanner\Data\Issue;
 use NPlusOneScanner\Data\ScanResult;
 use NPlusOneScanner\Discovery\ControllerViewMap;
@@ -38,14 +39,15 @@ final class Scanner
         $modelRegistry = new ModelRegistry($parserHelper);
 
         $modelDirs = $this->resolvePaths($basePath, $this->config['model_paths'] ?? ['app/Models']);
-        $modelRegistry->discover($modelDirs);
+        $appPaths = $this->resolvePaths($basePath, ['app', 'routes']);
+        $modelRegistry->discover($modelDirs, $this->resolvePaths($basePath, ['app']));
 
         $controllerViewMap = new ControllerViewMap($modelRegistry, $parserHelper);
-        $appPaths = $this->resolvePaths($basePath, ['app', 'routes']);
         $controllerViewMap->discover($appPaths);
 
         $analyzersConfig = $this->config['analyzers'] ?? [];
         $enablePhpLoops = ($analyzersConfig['php_loops'] ?? true);
+        $enableRelationshipChains = ($analyzersConfig['relationship_chains'] ?? true);
         $enableQueriesInLoops = ($analyzersConfig['queries_in_loops'] ?? true);
         $enableApiResources = ($analyzersConfig['api_resources'] ?? true) && ! ($options['no_resources'] ?? false);
         $enableBlade = ($analyzersConfig['blade_views'] ?? true) && ! ($options['no_blade'] ?? false);
@@ -53,6 +55,9 @@ final class Scanner
         $phpAnalyzers = [];
         if ($enablePhpLoops) {
             $phpAnalyzers[] = new PhpLoopAnalyzer($modelRegistry, $parserHelper);
+        }
+        if ($enableRelationshipChains) {
+            $phpAnalyzers[] = new RelationshipQueryChainAnalyzer($modelRegistry, $parserHelper);
         }
         if ($enableQueriesInLoops) {
             $phpAnalyzers[] = new DirectQueryInLoopAnalyzer($modelRegistry, $parserHelper);

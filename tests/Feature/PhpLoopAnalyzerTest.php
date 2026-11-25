@@ -98,33 +98,6 @@ class PhpLoopAnalyzerTest extends TestCase
         $this->assertCount(0, $issues);
     }
 
-    public function test_detects_relation_method_query_inside_loop(): void
-    {
-        $code = <<<'PHP'
-        <?php
-        namespace App\Http\Controllers;
-
-        use App\Models\User;
-
-        class UserController
-        {
-            public function index()
-            {
-                $users = User::with('posts')->get();
-                foreach ($users as $user) {
-                    $count = $user->posts()->count();
-                }
-            }
-        }
-        PHP;
-
-        $analyzer = new PhpLoopAnalyzer($this->makeRegistry());
-        $issues = $analyzer->analyze('app/Http/Controllers/UserController.php', $code);
-
-        $this->assertCount(1, $issues);
-        $this->assertStringContainsString('->posts()->count()', $issues[0]->message);
-    }
-
     public function test_resets_eager_loads_on_reassignment_and_transfers_across_query_and_aliases(): void
     {
         $code = <<<'PHP'
