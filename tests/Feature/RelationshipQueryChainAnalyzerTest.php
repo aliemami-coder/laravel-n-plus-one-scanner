@@ -59,4 +59,44 @@ class RelationshipQueryChainAnalyzerTest extends TestCase
         $this->assertStringContainsString("withMax('orders', 'amount')", $issues[5]->suggestion);
         $this->assertStringContainsString("withMin('orders', 'amount')", $issues[6]->suggestion);
     }
+
+    public function test_stops_at_query_execution_boundary_and_does_not_flag_collection_methods(): void
+    {
+        $registry = new ModelRegistry;
+        $registry->register(new ModelDefinition(
+            fqn: 'App\\Models\\User',
+            shortName: 'User',
+            file: 'app/Models/User.php',
+            relations: ['posts' => 'App\\Models\\Post'],
+        ));
+
+        $code = <<<'PHP'
+        <?php
+        namespace App\Http\Controllers;
+
+        use App\Models\User;
+
+        class UserController
+        {
+            public function index()
+            {
+                $users = User::all();
+                foreach ($users as $user) {
+                    $post = $user->posts()
+                        ->where('published', true)
+                        ->get()
+                        ->sortBy('created_at')
+                        ->first();
+                }
+            }
+        }
+        PHP;
+
+        $analyzer = new RelationshipQueryChainAnalyzer($registry);
+        $issues = $analyzer->analyze('app/Http/Controllers/UserController.php', $code);
+
+        // Only ->get() executes a SQL query; ->first() on the resulting Collection must NOT be flagged.
+        $this->assertCount(1, $issues);
+        $this->assertStringContainsString('->get()', $issues[0]->message);
+    }
 }

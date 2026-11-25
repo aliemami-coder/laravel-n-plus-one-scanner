@@ -183,6 +183,11 @@ final class DirectQueryInLoopAnalyzer implements AstAnalyzerInterface
     {
         $current = $call->var;
         while ($current instanceof Node\Expr\MethodCall) {
+            if ($current->name instanceof Node\Identifier
+                && in_array($current->name->toString(), ['get', 'first', 'firstOrFail', 'pluck', 'value', 'paginate', 'cursor', 'lazy'], true)
+            ) {
+                return null;
+            }
             $current = $current->var;
         }
 

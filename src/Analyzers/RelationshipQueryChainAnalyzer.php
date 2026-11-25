@@ -42,7 +42,35 @@ final class RelationshipQueryChainAnalyzer implements AstAnalyzerInterface
         'findOrFail',
         'pluck',
         'value',
+        'sole',
         'paginate',
+        'simplePaginate',
+        'cursorPaginate',
+        'cursor',
+        'lazy',
+        'lazyById',
+    ];
+
+    /**
+     * Methods that execute the SQL query and return a Collection, Paginator, or Model.
+     * Any chained calls after these boundaries operate in-memory and must not be
+     * treated as new SQL queries.
+     */
+    private const QUERY_EXECUTION_BOUNDARIES = [
+        'get',
+        'first',
+        'firstOrFail',
+        'find',
+        'findOrFail',
+        'pluck',
+        'value',
+        'sole',
+        'paginate',
+        'simplePaginate',
+        'cursorPaginate',
+        'cursor',
+        'lazy',
+        'lazyById',
     ];
 
     public function __construct(
@@ -306,6 +334,12 @@ final class RelationshipQueryChainAnalyzer implements AstAnalyzerInterface
                 && $current->name instanceof Node\Identifier
             ) {
                 return [$current->var->name, $current->name->toString(), $steps > 0];
+            }
+
+            if ($current->name instanceof Node\Identifier
+                && in_array($current->name->toString(), self::QUERY_EXECUTION_BOUNDARIES, true)
+            ) {
+                return null;
             }
 
             $steps++;
