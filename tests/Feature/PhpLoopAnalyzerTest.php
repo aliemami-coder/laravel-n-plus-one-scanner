@@ -183,4 +183,50 @@ class PhpLoopAnalyzerTest extends TestCase
         $this->assertCount(1, $issues);
         $this->assertSame(17, $issues[0]->line);
     }
+
+    public function test_detects_load_and_load_missing_and_load_aggregates_inside_loop(): void
+    {
+        $code = <<<'PHP'
+        <?php
+        namespace App\Http\Controllers;
+
+        use App\Models\User;
+
+        class UserController
+        {
+            public function bad()
+            {
+                $users = User::all();
+                foreach ($users as $user) {
+                    $user->loadMissing('posts');
+                    echo $user->posts;
+                    $user->load('posts');
+                    $user->loadCount('posts');
+                    $user->loadSum('orders', 'amount');
+                }
+            }
+
+            public function alreadyLoadedBeforeLoop()
+            {
+                $users = User::with('posts')->get();
+                foreach ($users as $user) {
+                    $user->loadMissing('posts');
+                    echo $user->posts;
+                }
+            }
+        }
+        PHP;
+
+        $analyzer = new PhpLoopAnalyzer($this->makeRegistry());
+        $issues = $analyzer->analyze('app/Http/Controllers/UserController.php', $code);
+
+        $this->assertCount(4, $issues);
+        foreach ($issues as $issue) {
+            $this->assertSame(Issue::TYPE_EAGER_LOAD_IN_LOOP, $issue->type);
+            $this->assertSame(Issue::SEVERITY_HIGH, $issue->severity);
+        }
+        $this->assertStringContainsString("Move `->loadMissing('posts')` before the loop", $issues[0]->suggestion);
+        $this->assertStringContainsString("withCount('posts')", $issues[2]->suggestion);
+        $this->assertStringContainsString("withSum('orders', 'column')", $issues[3]->suggestion);
+    }
 }

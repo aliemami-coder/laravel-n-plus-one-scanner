@@ -143,6 +143,7 @@ final class HtmlReporter
                     <select id="typeFilter">
                         <option value="all">All Patterns</option>
                         <option value="lazy_loading_in_loop">lazy_loading_in_loop</option>
+                        <option value="eager_load_in_loop">eager_load_in_loop</option>
                         <option value="query_in_loop">query_in_loop</option>
                         <option value="missing_when_loaded">missing_when_loaded</option>
                         <option value="blade_lazy_loading">blade_lazy_loading</option>

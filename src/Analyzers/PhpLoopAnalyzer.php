@@ -27,6 +27,19 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
         'mapWithKeys',
     ];
 
+    private const EAGER_LOAD_IN_LOOP_METHODS = [
+        'load',
+        'loadMissing',
+        'loadCount',
+        'loadExists',
+        'loadSum',
+        'loadAvg',
+        'loadMax',
+        'loadMin',
+        'loadMorph',
+        'loadMorphCount',
+    ];
+
     public function __construct(
         private readonly ModelRegistry $modelRegistry,
         private readonly PhpParserHelper $parserHelper = new PhpParserHelper,
@@ -104,9 +117,8 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
         array &$issues,
     ): void {
         foreach ($stmts as $stmt) {
-            $scope->processStatement($stmt);
-
             if ($stmt instanceof Node\Stmt\Foreach_) {
+                $scope->processStatement($stmt);
                 $itemVar = ($stmt->valueVar instanceof Node\Expr\Variable && is_string($stmt->valueVar->name))
                     ? $stmt->valueVar->name
                     : null;
@@ -121,12 +133,14 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
             }
 
             if ($stmt instanceof Node\Stmt\For_ || $stmt instanceof Node\Stmt\While_ || $stmt instanceof Node\Stmt\Do_) {
+                $scope->processStatement($stmt);
                 $this->scanStatements($stmt->stmts, clone $scope, $filePath, $content, true, $issues);
 
                 continue;
             }
 
             if ($stmt instanceof Node\Stmt\If_) {
+                $scope->processStatement($stmt);
                 $branchScopes = [];
 
                 $guardedRelations = $this->extractRelationLoadedGuards($stmt->cond);
@@ -162,6 +176,8 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
             if ($inLoop) {
                 $this->inspectNodeInLoop($stmt, $scope, $filePath, $content, $issues);
             }
+
+            $scope->processStatement($stmt);
         }
     }
 
@@ -237,6 +253,9 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
             }
         }
 
+        // Detect $item->load() / loadMissing() / loadCount() / loadSum() etc. inside loop
+        $this->detectEagerLoadCallsInLoop($node, $scope, $filePath, $content, $nodeFinder, $issues);
+
         // Detect $item->relation property access inside loop
         /** @var list<Node\Expr\PropertyFetch> $propFetches */
         $propFetches = $nodeFinder->findInstanceOf([$node], Node\Expr\PropertyFetch::class);
@@ -277,6 +296,99 @@ final class PhpLoopAnalyzer implements AstAnalyzerInterface
                 relation: $relationName,
                 message: "Potential N+1 lazy loading: accessing `\${$varName}->{$relationName}` inside a loop without eager loading.",
                 suggestion: "Add `->with('{$relationName}')` to the query or call `->loadMissing('{$relationName}')` before the loop.",
+                snippet: PhpParserHelper::getLineSnippet($content, $line),
+            );
+        }
+    }
+
+    /**
+     * Detect `$model->load()`, `loadMissing()`, `loadCount()`, `loadSum()`, etc. called inside loops.
+     *
+     * @param  list<Issue>  $issues
+     */
+    private function detectEagerLoadCallsInLoop(
+        Node $node,
+        ScopeContext $scope,
+        string $filePath,
+        string $content,
+        NodeFinder $nodeFinder,
+        array &$issues,
+    ): void {
+        /** @var list<Node\Expr\MethodCall> $calls */
+        $calls = $nodeFinder->findInstanceOf([$node], Node\Expr\MethodCall::class);
+
+        foreach ($calls as $call) {
+            if (! $call->var instanceof Node\Expr\Variable
+                || ! is_string($call->var->name)
+                || ! $call->name instanceof Node\Identifier
+            ) {
+                continue;
+            }
+
+            $methodName = $call->name->toString();
+            if (! in_array($methodName, self::EAGER_LOAD_IN_LOOP_METHODS, true)) {
+                continue;
+            }
+
+            $varName = $call->var->name;
+            $relations = PhpParserHelper::extractRelationNamesFromArgs($call->args);
+            $primaryRelation = $relations[0] ?? null;
+
+            // If loadMissing() is called for relations already guaranteed eager-loaded before the loop, skip.
+            if ($methodName === 'loadMissing' && $relations !== []) {
+                $allAlreadyLoaded = true;
+                foreach ($relations as $rel) {
+                    if (! $scope->isRelationEagerLoaded($varName, $rel)) {
+                        $allAlreadyLoaded = false;
+                        break;
+                    }
+                }
+                if ($allAlreadyLoaded) {
+                    continue;
+                }
+            }
+
+            $modelName = null;
+            $severity = Issue::SEVERITY_MEDIUM;
+
+            $varModel = $scope->getVariableModel($varName);
+            if ($varModel !== null) {
+                $modelDef = $this->modelRegistry->findByClassName($varModel);
+                $modelName = $modelDef?->shortName ?? PhpParserHelper::shortName($varModel);
+                $severity = Issue::SEVERITY_HIGH;
+            } elseif ($primaryRelation !== null) {
+                $resolved = $this->resolveRelationOwner($varName, $primaryRelation, $scope);
+                if ($resolved !== null) {
+                    [$modelName, $severity] = $resolved;
+                } elseif ($methodName === 'load') {
+                    // Avoid false positives on non-Eloquent ->load() calls when neither model nor relation is known.
+                    continue;
+                }
+            } elseif ($methodName === 'load') {
+                continue;
+            }
+
+            $line = $call->getStartLine();
+            $relLabel = $primaryRelation ?? 'relation';
+            $withEquivalent = match ($methodName) {
+                'loadCount' => "withCount('{$relLabel}')",
+                'loadExists' => "withExists('{$relLabel}')",
+                'loadSum' => "withSum('{$relLabel}', 'column')",
+                'loadAvg' => "withAvg('{$relLabel}', 'column')",
+                'loadMax' => "withMax('{$relLabel}', 'column')",
+                'loadMin' => "withMin('{$relLabel}', 'column')",
+                default => "with('{$relLabel}')",
+            };
+
+            $issues[] = new Issue(
+                file: $filePath,
+                line: $line,
+                type: Issue::TYPE_EAGER_LOAD_IN_LOOP,
+                severity: $severity,
+                model: $modelName,
+                relation: $primaryRelation,
+                message: "Calling `\${$varName}->{$methodName}('{$relLabel}')` inside a loop executes a SQL query per iteration (N+1 query).",
+                suggestion: "Move `->{$methodName}('{$relLabel}')` before the loop onto the collection (e.g. `\$collection->{$methodName}('{$relLabel}')`) or use `->{$withEquivalent}` in the initial query.",
                 snippet: PhpParserHelper::getLineSnippet($content, $line),
             );
         }

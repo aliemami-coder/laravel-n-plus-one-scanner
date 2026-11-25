@@ -10,6 +10,8 @@ final readonly class Issue
 
     public const TYPE_LAZY_LOADING_IN_LOOP = 'lazy_loading_in_loop';
 
+    public const TYPE_EAGER_LOAD_IN_LOOP = 'eager_load_in_loop';
+
     public const TYPE_QUERY_IN_LOOP = 'query_in_loop';
 
     public const TYPE_MISSING_WHEN_LOADED = 'missing_when_loaded';
