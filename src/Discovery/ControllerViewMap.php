@@ -169,42 +169,33 @@ final class ControllerViewMap
 
         $viewName = str_replace('/', '.', $first->value->value);
         $second = $args[1] ?? null;
-        if (! $second instanceof Node\Arg) {
-            return;
-        }
 
         $callSiteVars = [];
-        $dataExpr = $second->value;
-        if ($dataExpr instanceof Node\Expr\Array_) {
-            foreach ($dataExpr->items as $item) {
-                if ($item?->key instanceof Node\Scalar\String_) {
-                    $key = $item->key->value;
-                    $info = $scope->inspectCollectionExpression($item->value);
-                    if ($info['model'] !== null || $info['with'] !== []) {
-                        $callSiteVars[$key] = $info;
+        if ($second instanceof Node\Arg) {
+            $dataExpr = $second->value;
+            if ($dataExpr instanceof Node\Expr\Array_) {
+                foreach ($dataExpr->items as $item) {
+                    if ($item?->key instanceof Node\Scalar\String_) {
+                        $key = $item->key->value;
+                        $callSiteVars[$key] = $scope->inspectCollectionExpression($item->value);
                     }
                 }
-            }
-        } elseif ($dataExpr instanceof Node\Expr\FuncCall
-            && $dataExpr->name instanceof Node\Name
-            && $dataExpr->name->toString() === 'compact'
-        ) {
-            foreach ($dataExpr->args as $arg) {
-                if ($arg instanceof Node\Arg && $arg->value instanceof Node\Scalar\String_) {
-                    $varName = $arg->value->value;
-                    $info = [
-                        'model' => $scope->getVariableModel($varName),
-                        'with' => $scope->getEagerLoads($varName),
-                    ];
-                    if ($info['model'] !== null || $info['with'] !== []) {
-                        $callSiteVars[$varName] = $info;
+            } elseif ($dataExpr instanceof Node\Expr\FuncCall
+                && $dataExpr->name instanceof Node\Name
+                && $dataExpr->name->toString() === 'compact'
+            ) {
+                foreach ($dataExpr->args as $arg) {
+                    if ($arg instanceof Node\Arg && $arg->value instanceof Node\Scalar\String_) {
+                        $varName = $arg->value->value;
+                        $callSiteVars[$varName] = [
+                            'model' => $scope->getVariableModel($varName),
+                            'with' => $scope->getEagerLoads($varName),
+                        ];
                     }
                 }
             }
         }
 
-        if ($callSiteVars !== []) {
-            $this->viewCallSites[$viewName][] = $callSiteVars;
-        }
+        $this->viewCallSites[$viewName][] = $callSiteVars;
     }
 }
