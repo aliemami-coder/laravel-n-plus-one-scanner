@@ -15,8 +15,8 @@ use SplFileInfo;
  */
 final class ControllerViewMap
 {
-    /** @var array<string, array<string, array{model: ?string, with: list<string>}>> */
-    private array $viewContexts = [];
+    /** @var array<string, list<array<string, array{model: ?string, with: list<string>}>>> */
+    private array $viewCallSites = [];
 
     public function __construct(
         private readonly ModelRegistry $modelRegistry,
@@ -96,11 +96,66 @@ final class ControllerViewMap
     }
 
     /**
+     * Returns all recorded per-call-site variable contexts for a view.
+     *
+     * @return list<array<string, array{model: ?string, with: list<string>}>>
+     */
+    public function getCallSitesForView(string $viewName): array
+    {
+        return $this->viewCallSites[$viewName] ?? [];
+    }
+
+    /**
+     * Aggregates variable contexts across all call sites of a view, keeping only
+     * eager loads guaranteed in EVERY call site that passes the variable.
+     *
      * @return array<string, array{model: ?string, with: list<string>}>
      */
     public function getContextForView(string $viewName): array
     {
-        return $this->viewContexts[$viewName] ?? [];
+        $callSites = $this->viewCallSites[$viewName] ?? [];
+        if ($callSites === []) {
+            return [];
+        }
+
+        $varNames = [];
+        foreach ($callSites as $site) {
+            foreach (array_keys($site) as $varName) {
+                $varNames[$varName] = true;
+            }
+        }
+
+        $aggregated = [];
+        foreach (array_keys($varNames) as $varName) {
+            $models = [];
+            $withLists = [];
+
+            foreach ($callSites as $site) {
+                if (! array_key_exists($varName, $site)) {
+                    continue;
+                }
+                if ($site[$varName]['model'] !== null) {
+                    $models[] = $site[$varName]['model'];
+                }
+                $withLists[] = $site[$varName]['with'];
+            }
+
+            $uniqueModels = array_values(array_unique($models));
+            $agreedModel = count($uniqueModels) === 1 ? $uniqueModels[0] : null;
+
+            $guaranteedWith = count($withLists) === 1
+                ? $withLists[0]
+                : array_values(array_intersect(...$withLists));
+
+            if ($agreedModel !== null || $guaranteedWith !== []) {
+                $aggregated[$varName] = [
+                    'model' => $agreedModel,
+                    'with' => $guaranteedWith,
+                ];
+            }
+        }
+
+        return $aggregated;
     }
 
     /**
@@ -119,13 +174,16 @@ final class ControllerViewMap
             return;
         }
 
+        $callSiteVars = [];
         $dataExpr = $second->value;
         if ($dataExpr instanceof Node\Expr\Array_) {
             foreach ($dataExpr->items as $item) {
                 if ($item?->key instanceof Node\Scalar\String_) {
                     $key = $item->key->value;
                     $info = $scope->inspectCollectionExpression($item->value);
-                    $this->mergeViewVar($viewName, $key, $info);
+                    if ($info['model'] !== null || $info['with'] !== []) {
+                        $callSiteVars[$key] = $info;
+                    }
                 }
             }
         } elseif ($dataExpr instanceof Node\Expr\FuncCall
@@ -135,28 +193,19 @@ final class ControllerViewMap
             foreach ($dataExpr->args as $arg) {
                 if ($arg instanceof Node\Arg && $arg->value instanceof Node\Scalar\String_) {
                     $varName = $arg->value->value;
-                    $this->mergeViewVar($viewName, $varName, [
+                    $info = [
                         'model' => $scope->getVariableModel($varName),
                         'with' => $scope->getEagerLoads($varName),
-                    ]);
+                    ];
+                    if ($info['model'] !== null || $info['with'] !== []) {
+                        $callSiteVars[$varName] = $info;
+                    }
                 }
             }
         }
-    }
 
-    /**
-     * @param  array{model: ?string, with: list<string>}  $info
-     */
-    private function mergeViewVar(string $viewName, string $varName, array $info): void
-    {
-        if ($info['model'] === null && $info['with'] === []) {
-            return;
+        if ($callSiteVars !== []) {
+            $this->viewCallSites[$viewName][] = $callSiteVars;
         }
-
-        $existing = $this->viewContexts[$viewName][$varName] ?? ['model' => null, 'with' => []];
-        $this->viewContexts[$viewName][$varName] = [
-            'model' => $info['model'] ?? $existing['model'],
-            'with' => array_values(array_unique([...$existing['with'], ...$info['with']])),
-        ];
     }
 }
