@@ -58,10 +58,10 @@ final class ModelRegistry
     /** @var array<string, list<ModelDefinition>> Map of relationName => list<ModelDefinition> */
     private array $modelsByRelation = [];
 
-    /** @var array<string, array{relations: array<string, ?string>, defaultWith: list<string>, traits: list<string>}> */
+    /** @var array<string, array{relations: array<string, ?string>, defaultWith: ?list<string>, traits: list<string>}> */
     private array $traitDefinitions = [];
 
-    /** @var array<string, array{parent: ?string, relations: array<string, ?string>, defaultWith: list<string>, traits: list<string>, file: string, shortName: string, isModel: bool}> */
+    /** @var array<string, array{parent: ?string, relations: array<string, ?string>, defaultWith: ?list<string>, traits: list<string>, file: string, shortName: string, isModel: bool}> */
     private array $parsedClasses = [];
 
     public function __construct(
@@ -283,7 +283,9 @@ final class ModelRegistry
         foreach ($classInfo['relations'] as $relName => $related) {
             $relations[$relName] = $related;
         }
-        $defaultWith = [...$defaultWith, ...$classInfo['defaultWith']];
+        if ($classInfo['defaultWith'] !== null) {
+            $defaultWith = $classInfo['defaultWith'];
+        }
     }
 
     /**
@@ -321,7 +323,9 @@ final class ModelRegistry
         foreach ($traitInfo['relations'] as $relName => $related) {
             $relations[$relName] = $related;
         }
-        $defaultWith = [...$defaultWith, ...$traitInfo['defaultWith']];
+        if ($traitInfo['defaultWith'] !== null) {
+            $defaultWith = $traitInfo['defaultWith'];
+        }
     }
 
     private function looksLikeModel(Node\Stmt\Class_ $class): bool
@@ -468,26 +472,29 @@ final class ModelRegistry
     }
 
     /**
-     * @return list<string>
+     * @return list<string>|null Returns null when $with is not declared on this class/trait
      */
-    private function extractDefaultWith(Node\Stmt\ClassLike $classLike): array
+    private function extractDefaultWith(Node\Stmt\ClassLike $classLike): ?array
     {
-        $defaultWith = [];
-
         foreach ($classLike->getProperties() as $property) {
             foreach ($property->props as $prop) {
-                if ($prop->name->toString() !== 'with' || ! $prop->default instanceof Node\Expr\Array_) {
+                if ($prop->name->toString() !== 'with') {
                     continue;
                 }
 
-                foreach ($prop->default->items as $item) {
-                    if ($item?->value instanceof Node\Scalar\String_) {
-                        $defaultWith[] = PhpParserHelper::stripSelectColumns($item->value->value);
+                $defaultWith = [];
+                if ($prop->default instanceof Node\Expr\Array_) {
+                    foreach ($prop->default->items as $item) {
+                        if ($item?->value instanceof Node\Scalar\String_) {
+                            $defaultWith[] = PhpParserHelper::stripSelectColumns($item->value->value);
+                        }
                     }
                 }
+
+                return array_values(array_unique($defaultWith));
             }
         }
 
-        return array_values(array_unique($defaultWith));
+        return null;
     }
 }

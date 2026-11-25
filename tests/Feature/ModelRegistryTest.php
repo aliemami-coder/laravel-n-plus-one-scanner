@@ -152,4 +152,83 @@ class ModelRegistryTest extends TestCase
         unlink($tempDir.'/Comment.php');
         rmdir($tempDir);
     }
+
+    public function test_child_model_with_property_overrides_parent_and_trait_with_instead_of_merging(): void
+    {
+        $tempDir = sys_get_temp_dir().'/nplusone_with_override_'.uniqid();
+        mkdir($tempDir, 0755, true);
+
+        file_put_contents($tempDir.'/BaseModel.php', <<<'PHP'
+        <?php
+        namespace App\Models;
+
+        use Illuminate\Database\Eloquent\Model;
+
+        class BaseModel extends Model
+        {
+            protected $with = ['profile'];
+
+            public function profile()
+            {
+                return $this->hasOne(Profile::class);
+            }
+        }
+        PHP);
+
+        file_put_contents($tempDir.'/User.php', <<<'PHP'
+        <?php
+        namespace App\Models;
+
+        class User extends BaseModel
+        {
+            protected $with = ['settings'];
+
+            public function settings()
+            {
+                return $this->hasOne(Setting::class);
+            }
+        }
+        PHP);
+
+        file_put_contents($tempDir.'/Admin.php', <<<'PHP'
+        <?php
+        namespace App\Models;
+
+        class Admin extends BaseModel
+        {
+        }
+        PHP);
+
+        file_put_contents($tempDir.'/Guest.php', <<<'PHP'
+        <?php
+        namespace App\Models;
+
+        class Guest extends BaseModel
+        {
+            protected $with = [];
+        }
+        PHP);
+
+        $registry = new ModelRegistry;
+        $registry->discover([$tempDir]);
+
+        $user = $registry->findByClassName('App\\Models\\User');
+        $this->assertNotNull($user);
+        $this->assertTrue($user->isDefaultEagerLoaded('settings'));
+        $this->assertFalse($user->isDefaultEagerLoaded('profile'));
+
+        $admin = $registry->findByClassName('App\\Models\\Admin');
+        $this->assertNotNull($admin);
+        $this->assertTrue($admin->isDefaultEagerLoaded('profile'));
+
+        $guest = $registry->findByClassName('App\\Models\\Guest');
+        $this->assertNotNull($guest);
+        $this->assertFalse($guest->isDefaultEagerLoaded('profile'));
+
+        unlink($tempDir.'/BaseModel.php');
+        unlink($tempDir.'/User.php');
+        unlink($tempDir.'/Admin.php');
+        unlink($tempDir.'/Guest.php');
+        rmdir($tempDir);
+    }
 }
